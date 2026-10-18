@@ -17,9 +17,21 @@ export interface ConversionRecord {
   result_size: number | null;
   status: string;
   created_at: string;
+  preview_data?: string | null;
 }
 
-export async function logConversion(rec: Omit<ConversionRecord, 'id' | 'created_at'>) {
+export interface LogInput {
+  source_name: string;
+  source_format: string;
+  target_format: string;
+  category: string;
+  result_name: string | null;
+  result_size: number | null;
+  status: string;
+  preview_data?: string | null;
+}
+
+export async function logConversion(rec: LogInput) {
   try {
     await supabase.from('conversions').insert({
       source_name: rec.source_name,
@@ -29,6 +41,7 @@ export async function logConversion(rec: Omit<ConversionRecord, 'id' | 'created_
       result_name: rec.result_name,
       result_size: rec.result_size,
       status: rec.status,
+      preview_data: rec.preview_data ?? null,
     });
   } catch {
     // history logging is best-effort; never block the user

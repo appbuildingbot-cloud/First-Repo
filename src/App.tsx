@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowRight, CircleCheck as CheckCircle2, FileCode2, FileText, Github, Image as ImageIcon, Layers, Loader as Loader2, Sparkles, Trash2, Upload, X, Zap, Code as Code2, Type, Music, Video, Archive, Cpu, Circle as XCircle, Clock } from 'lucide-react';
+import {
+  ArrowRight, CircleCheck as CheckCircle2, FileText, Image as ImageIcon,
+  Layers, Loader as Loader2, Sparkles, Trash2, Upload, X, Zap,
+  Code as Code2, Type, Music, Video, Archive, Cpu, Circle as XCircle, Clock,
+  Eye, Download,
+} from 'lucide-react';
 import {
   FORMATS, FORMAT_MAP, CATEGORY_META, type Category, type FormatInfo,
   getFormat, targetsFor, extOf,
 } from './formats';
 import { convertFile, downloadBlob, ConvertError } from './converter';
-import { renderCodeToImage, RenderError } from './codeRenderer';
+import {
+  renderCodeToImage, renderCodeCanvas, makeThumbnail, detectMode,
+  type CodeMode, type RenderResult, RenderError, CODE_MODE_OPTIONS,
+} from './codeRenderer';
 import {
   fetchHistory, logConversion, clearHistory, type ConversionRecord,
 } from './supabase';
@@ -21,7 +29,15 @@ const EXT_COLOR: Record<Category, string> = {
 
 const CATEGORY_ORDER: Category[] = ['image', 'document', 'text', 'audio', 'video', 'code', 'archive', 'binary'];
 
-type Tab = 'convert' | 'formats' | 'history';
+const SAMPLE_HTML = `<div style="min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#06b6d4,#10b981);font-family:Inter,sans-serif">
+  <div style="background:#fff;padding:48px 56px;border-radius:24px;box-shadow:0 20px 60px rgba(0,0,0,.15);text-align:center">
+    <h1 style="margin:0 0 12px;color:#0f172a;font-size:42px">Hello, world</h1>
+    <p style="margin:0;color:#64748b;font-size:18px">Rendered live from your code</p>
+    <button style="margin-top:24px;padding:12px 28px;border:0;border-radius:999px;background:linear-gradient(135deg,#06b6d4,#10b981);color:#04121a;font-weight:600;font-size:16px;cursor:pointer">Get started</button>
+  </div>
+</div>`;
+
+type Tab = 'convert' | 'code' | 'formats' | 'history';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('convert');
@@ -36,13 +52,21 @@ export default function App() {
   const [history, setHistory] = useState<ConversionRecord[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Code > Image tab state
+  const [codeInput, setCodeInput] = useState<string>(SAMPLE_HTML);
+  const [codeLang, setCodeLang] = useState<CodeMode>('html');
+  const [codePreview, setCodePreview] = useState<string>('');
+  const [codeError, setCodeError] = useState<string | null>(null);
+  const [codeBusy, setCodeBusy] = useState(false);
+  const [codeResult, setCodeResult] = useState<RenderResult | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const sourceFormat = useMemo<FormatInfo | null>(() => (file ? getFormat(file.name) : null), [file]);
   const unknownFormat = file !== null && sourceFormat === null;
 
   const targetList = useMemo<FormatInfo[]>(() => {
     if (!sourceFormat) return [];
     if (codeMode && sourceFormat.category === 'code') {
-      // code -> image: all image targets available
       return FORMATS.filter(f => f.category === 'image');
     }
     return targetsFor(sourceFormat);
@@ -57,6 +81,31 @@ export default function App() {
   useEffect(() => {
     if (tab === 'history') loadHistory();
   }, [tab]);
+
+  // Live preview for Code > Image tab
+  useEffect(() => {
+    if (tab !== 'code') return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!codeInput.trim()) { setCodePreview(''); setCodeError(null); return; }
+    debounceRef.current = setTimeout(() => {
+      void updateCodePreview();
+    }, 400);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codeInput, codeLang, tab]);
+
+  const updateCodePreview = async () => {
+    setCodeError(null);
+    try {
+      const canvas = await renderCodeCanvas(codeInput, codeLang);
+      const url = canvas.toDataURL('image/png');
+      setCodePreview(url);
+      setCodeResult(null);
+    } catch (err) {
+      setCodePreview('');
+      setCodeError(err instanceof RenderError ? err.message : 'Could not render this code.');
+    }
+  };
 
   const loadHistory = async () => setHistory(await fetchHistory());
 
@@ -87,7 +136,6 @@ export default function App() {
       } else {
         res = await convertFile(file, sourceFormat, targetFmt);
       }
-      downloadBlob(res.blob, res.fileName);
       const isImage = targetFmt.category === 'image' || (codeMode && sourceFormat.category === 'code');
       const url = isImage ? URL.createObjectURL(res.blob) : '';
       setResult({ name: res.fileName, size: res.size, url, isImage });
@@ -99,6 +147,7 @@ export default function App() {
         result_name: res.fileName,
         result_size: res.size,
         status: 'success',
+        preview_data: (res as { dataUrl?: string }).dataUrl ?? null,
       });
     } catch (err) {
       const msg = err instanceof ConvertError || err instanceof RenderError
@@ -116,6 +165,36 @@ export default function App() {
       });
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runCodeImage = async () => {
+    if (!codeInput.trim() || !codePreview) return;
+    setCodeBusy(true); setCodeError(null);
+    try {
+      const canvas = await renderCodeCanvas(codeInput, codeLang);
+      const blob: Blob = await new Promise((resolve, reject) =>
+        canvas.toBlob(b => b ? resolve(b) : reject(new RenderError('Rendering produced no image.')), 'image/png', 0.95),
+      );
+      const fileName = `code-image.${codeLang === 'svg' ? 'svg' : 'png'}`;
+      const dataUrl = canvas.toDataURL('image/png');
+      const res: RenderResult = { blob, fileName, size: blob.size, dataUrl };
+      setCodeResult(res);
+      downloadBlob(res.blob, res.fileName);
+      await logConversion({
+        source_name: `code (${codeLang})`,
+        source_format: codeLang.toUpperCase(),
+        target_format: 'PNG',
+        category: 'image',
+        result_name: res.fileName,
+        result_size: res.size,
+        status: 'success',
+        preview_data: makeThumbnail(canvas, 280),
+      });
+    } catch (err) {
+      setCodeError(err instanceof RenderError ? err.message : 'Could not render this code to an image.');
+    } finally {
+      setCodeBusy(false);
     }
   };
 
@@ -143,12 +222,10 @@ export default function App() {
           </div>
           <nav className="nav">
             <button className={`nav-btn ${tab === 'convert' ? 'active' : ''}`} onClick={() => setTab('convert')}>Convert</button>
+            <button className={`nav-btn ${tab === 'code' ? 'active' : ''}`} onClick={() => setTab('code')}>Code &gt; Image</button>
             <button className={`nav-btn ${tab === 'formats' ? 'active' : ''}`} onClick={() => setTab('formats')}>Formats</button>
             <button className={`nav-btn ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
           </nav>
-          <a className="gh-link" href="https://github.com" target="_blank" rel="noreferrer">
-            <Github size={15} /> GitHub
-          </a>
         </div>
       </header>
 
@@ -158,7 +235,7 @@ export default function App() {
             <section className="hero">
               <div className="hero-badge"><Sparkles size={13} /> Universal converter · {supportedCount}+ formats</div>
               <h1>Convert any file.<br />Beautifully.</h1>
-              <p>Drop in images, documents, audio, video, code, archives, even CAD files — and convert them in seconds. Plus a special mode that renders your code into the actual image it produces.</p>
+              <p>Drop in images, documents, audio, video, code, archives, even CAD files — and convert them in seconds. Try the Code &gt; Image tab to turn any code into the real picture it produces.</p>
               <div className="hero-stats">
                 <div className="stat"><div className="stat-num">{supportedCount}+</div><div className="stat-label">Formats</div></div>
                 <div className="stat"><div className="stat-num">8</div><div className="stat-label">Categories</div></div>
@@ -251,7 +328,6 @@ export default function App() {
                         )}
                       </div>
                       <button className="btn btn-ghost btn-sm" onClick={() => {
-                        // re-trigger download from the in-memory blob URL
                         const a = document.createElement('a');
                         a.href = result.url || '#';
                         a.download = result.name;
@@ -283,8 +359,9 @@ export default function App() {
                   <div className="feature-banner-icon"><Code2 size={26} /></div>
                   <div className="feature-banner-text">
                     <h3>Code → Image, for real</h3>
-                    <p>Toggle "render code to image" on any code file. We execute drawing code, render HTML/CSS, draw SVG, plot JSON trees, and interpret turtle graphics — producing the visual the code actually describes.</p>
+                    <p>Open the Code &gt; Image tab to paste any HTML, CSS, SVG, Markdown, JSON, Canvas JS, or turtle graphics — and watch it render into the actual image it describes, with a live preview before you download.</p>
                   </div>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setTab('code')}>Try it <ArrowRight size={15} /></button>
                 </div>
 
                 <section className="section">
@@ -336,13 +413,92 @@ export default function App() {
                     <div className="feature">
                       <div className="feature-icon" style={{ background: 'rgba(244,114,182,0.15)', color: '#f472b6' }}><Clock size={24} /></div>
                       <h3>Saved history</h3>
-                      <p>Every conversion is logged so you can revisit what you've converted, when, and to what format.</p>
+                      <p>Every conversion is logged with a thumbnail preview so you can revisit what you've made.</p>
                     </div>
                   </div>
                 </section>
               </>
             )}
           </>
+        )}
+
+        {tab === 'code' && (
+          <section className="code-tab fade-up">
+            <div className="section-head">
+              <h2>Code &gt; Image</h2>
+              <p>Paste any code and watch it render into the real image it produces — live, before you download.</p>
+            </div>
+
+            <div className="code-grid">
+              <div className="code-editor">
+                <div className="label">Your code</div>
+                <div className="code-toolbar">
+                  {CODE_MODE_OPTIONS.map(m => (
+                    <button
+                      key={m.id}
+                      className={`mode-btn ${codeLang === m.id ? 'active' : ''}`}
+                      onClick={() => { setCodeLang(m.id); setCodeResult(null); }}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="code-hint">
+                  {CODE_MODE_OPTIONS.find(m => m.id === codeLang)?.hint}
+                </div>
+                <textarea
+                  className="code-textarea"
+                  value={codeInput}
+                  onChange={(e) => { setCodeInput(e.target.value); setCodeResult(null); }}
+                  spellCheck={false}
+                  placeholder={`Paste ${codeLang.toUpperCase()} here…`}
+                />
+                <div className="code-actions">
+                  <button
+                    className="btn btn-primary"
+                    onClick={runCodeImage}
+                    disabled={codeBusy || !codePreview}
+                  >
+                    {codeBusy ? <span className="spinner" /> : <Download size={18} />}
+                    {codeBusy ? 'Rendering…' : 'Download PNG'}
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => { setCodeInput(''); setCodePreview(''); setCodeResult(null); setCodeError(null); }}
+                  >
+                    <X size={15} /> Clear
+                  </button>
+                </div>
+                {codeError && (
+                  <div className="error-box"><XCircle size={18} style={{ flexShrink: 0, marginTop: 2 }} /><span>{codeError}</span></div>
+                )}
+              </div>
+
+              <div className="code-preview">
+                <div className="code-preview-label">
+                  <Eye size={13} style={{ display: 'inline', marginRight: 6, verticalAlign: -2 }} />
+                  Live preview
+                </div>
+                <div className="code-preview-frame">
+                  {codePreview
+                    ? <img src={codePreview} alt="Rendered code preview" />
+                    : <div className="code-preview-empty">Your rendered image will appear here as you type.</div>}
+                </div>
+                {codeResult && (
+                  <div className="result fade-up" style={{ marginTop: 0 }}>
+                    <div className="result-icon"><CheckCircle2 size={24} /></div>
+                    <div className="result-meta">
+                      <div className="result-title">{codeResult.fileName}</div>
+                      <div className="result-sub">{formatBytes(codeResult.size)} · downloaded</div>
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => downloadBlob(codeResult.blob, codeResult.fileName)}>
+                      <Download size={15} /> Download again
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
         )}
 
         {tab === 'formats' && (
@@ -380,26 +536,39 @@ export default function App() {
           <section className="section">
             <div className="section-head">
               <h2>Conversion history</h2>
-              <p>A log of everything you've converted in this browser.</p>
+              <p>A log of everything you've converted, with image previews where available.</p>
             </div>
             <div className="card">
               {history.length === 0 ? (
-                <div className="empty">No conversions yet. Drop a file on the Convert tab to get started.</div>
+                <div className="empty">No conversions yet. Convert a file or render some code to get started.</div>
               ) : (
                 <>
                   <div className="history-list">
-                    {history.map(h => (
-                      <div key={h.id} className="history-item">
-                        <div className="history-flow">
-                          <span className="history-tag" style={{ background: `${EXT_COLOR[(h.category as Category)] ?? '#64748b'}22`, color: EXT_COLOR[(h.category as Category)] ?? '#64748b' }}>{h.source_format}</span>
-                          <ArrowRight size={14} className="history-arrow" />
-                          <span className="history-tag" style={{ background: `${EXT_COLOR[(h.category as Category)] ?? '#64748b'}22`, color: EXT_COLOR[(h.category as Category)] ?? '#64748b' }}>{h.target_format}</span>
-                          <span className="history-name">{h.source_name}{h.result_name ? ` → ${h.result_name}` : ''}</span>
+                    {history.map(h => {
+                      const hasPreview = !!h.preview_data;
+                      return (
+                        <div key={h.id} className={`history-item ${hasPreview ? 'with-preview' : ''}`}>
+                          {hasPreview && (
+                            <img className="history-thumb" src={h.preview_data!} alt="Result preview" />
+                          )}
+                          <div className="history-body">
+                            <div className="history-flow">
+                              <span className="history-tag" style={{ background: `${EXT_COLOR[(h.category as Category)] ?? '#64748b'}22`, color: EXT_COLOR[(h.category as Category)] ?? '#64748b' }}>{h.source_format}</span>
+                              <ArrowRight size={14} className="history-arrow" />
+                              <span className="history-tag" style={{ background: `${EXT_COLOR[(h.category as Category)] ?? '#64748b'}22`, color: EXT_COLOR[(h.category as Category)] ?? '#64748b' }}>{h.target_format}</span>
+                              <span className="history-name">{h.source_name}{h.result_name ? ` → ${h.result_name}` : ''}</span>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                              <span className={`history-status ${h.status}`}>{h.status}</span>
+                              <span className="history-time">{new Date(h.created_at).toLocaleString()}</span>
+                              {h.result_size != null && (
+                                <span className="history-time">{formatBytes(h.result_size)}</span>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        <span className={`history-status ${h.status}`}>{h.status}</span>
-                        <span className="history-time">{new Date(h.created_at).toLocaleString()}</span>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                   <button className="btn btn-ghost btn-sm" style={{ marginTop: 18 }} onClick={onClearHistory}>
                     <Trash2 size={15} /> Clear history
@@ -411,7 +580,7 @@ export default function App() {
         )}
 
         <footer className="footer">
-          Convertly · Universal file converter · Open source on GitHub
+          Convertly · Universal file converter
         </footer>
       </main>
     </>
