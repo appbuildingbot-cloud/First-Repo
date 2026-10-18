@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ArrowRight, CircleCheck as CheckCircle2, FileText, Image as ImageIcon,
-  Layers, Loader as Loader2, Sparkles, Trash2, Upload, X, Zap,
-  Code as Code2, Type, Music, Video, Archive, Cpu, Circle as XCircle, Clock,
-  Eye, Download,
-} from 'lucide-react';
+import { ArrowRight, CircleCheck as CheckCircle2, FileText, Image as ImageIcon, Layers, Sparkles, Trash2, Upload, X, Zap, Code as Code2, Type, Music, Video, Archive, Cpu, Circle as XCircle, Clock, Eye, Download, Mic, MicOff, Search, BookOpen, Wand as Wand2, ClipboardList } from 'lucide-react';
 import {
   FORMATS, FORMAT_MAP, CATEGORY_META, type Category, type FormatInfo,
   getFormat, targetsFor, extOf,
@@ -17,6 +12,11 @@ import {
 import {
   fetchHistory, logConversion, clearHistory, type ConversionRecord,
 } from './supabase';
+import { findExamples, type HtmlExample } from './htmlExamples';
+import {
+  parseSoap, soapToHtml, createSpeechRecognition, speechSupported,
+  type SoapNote, type SoapSection, type SpeechRecognitionLike,
+} from './soapNotes';
 
 const ICONS: Record<string, React.ComponentType<{ size?: number | string }>> = {
   Image: ImageIcon, FileText, Type, Music, Video, Code2, Archive, Cpu,
@@ -37,7 +37,7 @@ const SAMPLE_HTML = `<div style="min-height:100vh;display:grid;place-items:cente
   </div>
 </div>`;
 
-type Tab = 'convert' | 'code' | 'formats' | 'history';
+type Tab = 'convert' | 'code' | 'text2html' | 'soap' | 'formats' | 'history';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('convert');
@@ -61,6 +61,27 @@ export default function App() {
   const [codeResult, setCodeResult] = useState<RenderResult | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Text > HTML tab state
+  const [t2hQuery, setT2hQuery] = useState('');
+  const [t2hExamples, setT2hExamples] = useState<HtmlExample[]>([]);
+  const [t2hCode, setT2hCode] = useState('');
+  const [t2hPreview, setT2hPreview] = useState('');
+  const [t2hError, setT2hError] = useState<string | null>(null);
+  const [t2hBusy, setT2hBusy] = useState(false);
+  const [t2hResult, setT2hResult] = useState<RenderResult | null>(null);
+  const t2hDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // SOAP notes tab state
+  const [soapTranscript, setSoapTranscript] = useState('');
+  const [soapNote, setSoapNote] = useState<SoapNote | null>(null);
+  const [soapListening, setSoapListening] = useState(false);
+  const [soapError, setSoapError] = useState<string | null>(null);
+  const [soapStudyMode, setSoapStudyMode] = useState(true);
+  const [soapPreview, setSoapPreview] = useState('');
+  const [soapBusy, setSoapBusy] = useState(false);
+  const [soapResult, setSoapResult] = useState<RenderResult | null>(null);
+  const soapRecRef = useRef<SpeechRecognitionLike | null>(null);
+
   const sourceFormat = useMemo<FormatInfo | null>(() => (file ? getFormat(file.name) : null), [file]);
   const unknownFormat = file !== null && sourceFormat === null;
 
@@ -80,6 +101,7 @@ export default function App() {
 
   useEffect(() => {
     if (tab === 'history') loadHistory();
+    if (tab === 'soap') stopListening();
   }, [tab]);
 
   // Live preview for Code > Image tab
@@ -104,6 +126,144 @@ export default function App() {
     } catch (err) {
       setCodePreview('');
       setCodeError(err instanceof RenderError ? err.message : 'Could not render this code.');
+    }
+  };
+
+  // Text > HTML live preview
+  useEffect(() => {
+    if (tab !== 'text2html') return;
+    if (t2hDebounce.current) clearTimeout(t2hDebounce.current);
+    if (!t2hCode.trim()) { setT2hPreview(''); setT2hError(null); return; }
+    t2hDebounce.current = setTimeout(() => { void updateT2hPreview(); }, 400);
+    return () => { if (t2hDebounce.current) clearTimeout(t2hDebounce.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [t2hCode, tab]);
+
+  const updateT2hPreview = async () => {
+    setT2hError(null);
+    try {
+      const canvas = await renderCodeCanvas(t2hCode, 'html');
+      setT2hPreview(canvas.toDataURL('image/png'));
+      setT2hResult(null);
+    } catch (err) {
+      setT2hPreview('');
+      setT2hError(err instanceof RenderError ? err.message : 'Could not render this HTML.');
+    }
+  };
+
+  const runT2hSearch = () => {
+    const found = findExamples(t2hQuery, 6);
+    setT2hExamples(found);
+  };
+
+  const renderT2hImage = async () => {
+    if (!t2hCode.trim() || !t2hPreview) return;
+    setT2hBusy(true); setT2hError(null);
+    try {
+      const canvas = await renderCodeCanvas(t2hCode, 'html');
+      const blob: Blob = await new Promise((resolve, reject) =>
+        canvas.toBlob(b => b ? resolve(b) : reject(new RenderError('Rendering produced no image.')), 'image/png', 0.95),
+      );
+      const fileName = 'text-to-html.png';
+      const dataUrl = canvas.toDataURL('image/png');
+      const res: RenderResult = { blob, fileName, size: blob.size, dataUrl };
+      setT2hResult(res);
+      downloadBlob(res.blob, res.fileName);
+      await logConversion({
+        source_name: `text: ${t2hQuery.slice(0, 40) || 'html'}`,
+        source_format: 'TXT',
+        target_format: 'PNG',
+        category: 'image',
+        result_name: res.fileName,
+        result_size: res.size,
+        status: 'success',
+        preview_data: makeThumbnail(canvas, 280),
+      });
+    } catch (err) {
+      setT2hError(err instanceof RenderError ? err.message : 'Could not render this HTML to an image.');
+    } finally {
+      setT2hBusy(false);
+    }
+  };
+
+  // SOAP: regenerate note + preview whenever transcript/mode changes
+  useEffect(() => {
+    if (tab !== 'soap') return;
+    if (!soapTranscript.trim()) {
+      setSoapNote(null); setSoapPreview(''); return;
+    }
+    const note = parseSoap(soapTranscript, soapStudyMode);
+    setSoapNote(note);
+    void (async () => {
+      try {
+        const canvas = await renderCodeCanvas(soapToHtml(note), 'html');
+        setSoapPreview(canvas.toDataURL('image/png'));
+        setSoapResult(null);
+      } catch {
+        setSoapPreview('');
+      }
+    })();
+  }, [soapTranscript, soapStudyMode, tab]);
+
+  const startListening = () => {
+    if (!speechSupported()) {
+      setSoapError('Your browser does not support speech recognition. Try Chrome or Edge.');
+      return;
+    }
+    const rec = createSpeechRecognition();
+    if (!rec) return;
+    let finalText = soapTranscript;
+    rec.onresult = (e) => {
+      let interim = '';
+      const results = e.results as unknown as { [key: number]: { 0: { transcript: string } } };
+      for (let i = e.resultIndex; i < (e.results as { length: number }).length; i++) {
+        interim += results[i][0].transcript;
+      }
+      setSoapTranscript((finalText + ' ' + interim).trim());
+    };
+    rec.onerror = () => setSoapError('Speech recognition error. Check microphone access and try again.');
+    rec.onend = () => setSoapListening(false);
+    rec.start();
+    soapRecRef.current = rec;
+    setSoapListening(true);
+    setSoapError(null);
+  };
+
+  const stopListening = () => {
+    if (soapRecRef.current) {
+      soapRecRef.current.abort();
+      soapRecRef.current = null;
+    }
+    setSoapListening(false);
+  };
+
+  const renderSoapImage = async () => {
+    if (!soapNote || !soapPreview) return;
+    setSoapBusy(true); setSoapError(null);
+    try {
+      const canvas = await renderCodeCanvas(soapToHtml(soapNote), 'html');
+      const blob: Blob = await new Promise((resolve, reject) =>
+        canvas.toBlob(b => b ? resolve(b) : reject(new RenderError('Rendering produced no image.')), 'image/png', 0.95),
+      );
+      const fileName = 'soap-notes.png';
+      const dataUrl = canvas.toDataURL('image/png');
+      const res: RenderResult = { blob, fileName, size: blob.size, dataUrl };
+      setSoapResult(res);
+      downloadBlob(res.blob, res.fileName);
+      await logConversion({
+        source_name: 'soap notes (voice)',
+        source_format: 'VOICE',
+        target_format: 'PNG',
+        category: 'image',
+        result_name: res.fileName,
+        result_size: res.size,
+        status: 'success',
+        preview_data: makeThumbnail(canvas, 280),
+      });
+    } catch {
+      setSoapError('Could not render SOAP notes to an image.');
+    } finally {
+      setSoapBusy(false);
     }
   };
 
@@ -223,6 +383,8 @@ export default function App() {
           <nav className="nav">
             <button className={`nav-btn ${tab === 'convert' ? 'active' : ''}`} onClick={() => setTab('convert')}>Convert</button>
             <button className={`nav-btn ${tab === 'code' ? 'active' : ''}`} onClick={() => setTab('code')}>Code &gt; Image</button>
+            <button className={`nav-btn ${tab === 'text2html' ? 'active' : ''}`} onClick={() => setTab('text2html')}>Text → HTML</button>
+            <button className={`nav-btn ${tab === 'soap' ? 'active' : ''}`} onClick={() => setTab('soap')}>SOAP Notes</button>
             <button className={`nav-btn ${tab === 'formats' ? 'active' : ''}`} onClick={() => setTab('formats')}>Formats</button>
             <button className={`nav-btn ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
           </nav>
@@ -496,6 +658,172 @@ export default function App() {
                     </button>
                   </div>
                 )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {tab === 'text2html' && (
+          <section className="code-tab fade-up">
+            <div className="section-head">
+              <h2>Text → HTML</h2>
+              <p>Type what you want, like “html for a cat”, pick an example, then render it into a real image.</p>
+            </div>
+
+            <div className="t2h-search">
+              <div className="t2h-search-bar">
+                <Search size={18} className="t2h-search-icon" />
+                <input
+                  className="t2h-search-input"
+                  placeholder="Try: html for a cat, a button, a hero section…"
+                  value={t2hQuery}
+                  onChange={(e) => setT2hQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') runT2hSearch(); }}
+                />
+                <button className="btn btn-primary btn-sm" onClick={runT2hSearch}>
+                  <Wand2 size={15} /> Find examples
+                </button>
+              </div>
+            </div>
+
+            {t2hExamples.length > 0 && (
+              <div className="t2h-examples">
+                {t2hExamples.map(ex => (
+                  <button
+                    key={ex.id}
+                    className={`t2h-example ${t2hCode === ex.html ? 'active' : ''}`}
+                    onClick={() => { setT2hCode(ex.html); }}
+                  >
+                    {ex.title}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="code-grid">
+              <div className="code-editor">
+                <div className="label">HTML</div>
+                <textarea
+                  className="code-textarea"
+                  value={t2hCode}
+                  onChange={(e) => setT2hCode(e.target.value)}
+                  spellCheck={false}
+                  placeholder="Your HTML appears here — edit it freely."
+                />
+                <div className="code-actions">
+                  <button className="btn btn-primary" onClick={renderT2hImage} disabled={t2hBusy || !t2hPreview}>
+                    {t2hBusy ? <span className="spinner" /> : <Download size={18} />}
+                    {t2hBusy ? 'Rendering…' : 'Download PNG'}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => { setT2hCode(''); setT2hPreview(''); setT2hResult(null); setT2hError(null); }}>
+                    <X size={15} /> Clear
+                  </button>
+                </div>
+                {t2hError && (
+                  <div className="error-box"><XCircle size={18} style={{ flexShrink: 0, marginTop: 2 }} /><span>{t2hError}</span></div>
+                )}
+              </div>
+
+              <div className="code-preview">
+                <div className="code-preview-label">
+                  <Eye size={13} style={{ display: 'inline', marginRight: 6, verticalAlign: -2 }} />
+                  Live preview
+                </div>
+                <div className="code-preview-frame">
+                  {t2hPreview
+                    ? <img src={t2hPreview} alt="Rendered HTML preview" />
+                    : <div className="code-preview-empty">Search for an example and edit the HTML to see it render.</div>}
+                </div>
+                {t2hResult && (
+                  <div className="result fade-up" style={{ marginTop: 0 }}>
+                    <div className="result-icon"><CheckCircle2 size={24} /></div>
+                    <div className="result-meta">
+                      <div className="result-title">{t2hResult.fileName}</div>
+                      <div className="result-sub">{formatBytes(t2hResult.size)} · downloaded</div>
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => downloadBlob(t2hResult.blob, t2hResult.fileName)}>
+                      <Download size={15} /> Download again
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {tab === 'soap' && (
+          <section className="code-tab fade-up">
+            <div className="section-head">
+              <h2>SOAP Notes — Study Mode</h2>
+              <p>Talk out loud while you study. Your speech is split into Subjective, Objective, Assessment, and Plan — then rendered into a clean image you can save.</p>
+            </div>
+
+            <div className="soap-controls">
+              <button
+                className={`btn ${soapListening ? 'btn-danger' : 'btn-primary'}`}
+                onClick={soapListening ? stopListening : startListening}
+              >
+                {soapListening ? <MicOff size={18} /> : <Mic size={18} />}
+                {soapListening ? 'Stop listening' : 'Start talking'}
+              </button>
+              <label className="soap-toggle">
+                <input type="checkbox" checked={soapStudyMode} onChange={(e) => setSoapStudyMode(e.target.checked)} />
+                <BookOpen size={15} /> Study SOAP (Topic / Facts / Understanding / Plan)
+              </label>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => { setSoapTranscript(''); setSoapNote(null); setSoapPreview(''); setSoapResult(null); setSoapError(null); }}
+              >
+                <X size={15} /> Clear
+              </button>
+            </div>
+
+            {soapError && (
+              <div className="error-box"><XCircle size={18} style={{ flexShrink: 0, marginTop: 2 }} /><span>{soapError}</span></div>
+            )}
+
+            <div className="code-grid">
+              <div className="code-editor">
+                <div className="label">Transcript {soapListening && <span className="soap-live"><span className="soap-live-dot" /> listening</span>}</div>
+                <textarea
+                  className="code-textarea"
+                  value={soapTranscript}
+                  onChange={(e) => setSoapTranscript(e.target.value)}
+                  spellCheck={false}
+                  placeholder="Your speech will appear here. You can also type or paste. Say words like “subjective”, “objective”, “assessment”, “plan” to mark sections."
+                />
+              </div>
+
+              <div className="code-preview">
+                <div className="code-preview-label">
+                  <ClipboardList size={13} style={{ display: 'inline', marginRight: 6, verticalAlign: -2 }} />
+                  SOAP notes
+                </div>
+                <div className="soap-preview-frame">
+                  {soapNote && soapNote.sections.some(s => s.text.trim()) ? (
+                    <div className="soap-cards">
+                      {soapNote.sections.filter(s => s.text.trim()).map(s => (
+                        <div className="soap-card" key={s.id} style={{ borderLeftColor: s.color }}>
+                          <div className="soap-card-label" style={{ color: s.color }}>{s.label}</div>
+                          <div className="soap-card-text">{s.text}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="code-preview-empty">Press “Start talking” and narrate your study notes. Your structured SOAP summary appears here.</div>
+                  )}
+                </div>
+                <div className="code-actions">
+                  <button className="btn btn-primary" onClick={renderSoapImage} disabled={soapBusy || !soapPreview}>
+                    {soapBusy ? <span className="spinner" /> : <Download size={18} />}
+                    {soapBusy ? 'Rendering…' : 'Download as image'}
+                  </button>
+                  {soapResult && (
+                    <button className="btn btn-ghost btn-sm" onClick={() => downloadBlob(soapResult.blob, soapResult.fileName)}>
+                      <Download size={15} /> Download again
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </section>

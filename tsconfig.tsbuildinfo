@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/codeRenderer.ts","./src/converter.ts","./src/formats.ts","./src/main.tsx","./src/supabase.ts","./src/vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/codeRenderer.ts","./src/converter.ts","./src/formats.ts","./src/htmlExamples.ts","./src/main.tsx","./src/soapNotes.ts","./src/supabase.ts","./src/vite-env.d.ts"],"version":"5.9.3"}
